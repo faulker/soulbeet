@@ -13,7 +13,7 @@ const UNKNOWN_CANDIDATE: &str = "That match is not one beets found for this impo
 const NOT_AN_ID: &str = "That is not a MusicBrainz link or ID";
 
 /// beets' name for its MusicBrainz source.
-const MUSICBRAINZ: &str = "MusicBrainz";
+pub(crate) const MUSICBRAINZ: &str = "MusicBrainz";
 
 /// The entities of musicbrainz.org links, by their path segment.
 const MUSICBRAINZ_ENTITIES: [&str; 15] = [

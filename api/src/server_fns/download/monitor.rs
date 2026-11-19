@@ -13,7 +13,7 @@ use shared::download::{
 };
 use shared::failure::{Failure, FailureCode, RetryAdvice, Stage};
 use soulbeet::error::SoulseekError;
-use soulbeet::{DownloadBackend, ImportMode};
+use soulbeet::{DownloadBackend, DriverChoice, ImportMode};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -32,7 +32,7 @@ use super::utils::{file_id, FileId};
 use crate::config::CONFIG;
 use crate::core::database_failure;
 use crate::globals::send_user_event;
-use crate::import_queue::IMPORT_QUEUE;
+use crate::import_queue::{IMPORT_QUEUE, MUSICBRAINZ_SOURCE};
 use crate::ledger::{DuplicateRule, JobEvent, JobState, Ledger};
 use crate::services::{download_backend, BackendLookupError};
 use crate::transfer_registry::{AddedSlot, BatchRef, TransferKey, TransferOwner, TransferRegistry};
@@ -1423,6 +1423,7 @@ impl DownloadMonitor {
             download_base: self.download_base.clone(),
             claimed: Arc::clone(&self.claimed),
             ledger: self.ledger.clone(),
+            pinned_recording: self.batch.pinned_recording.clone(),
         };
         // Spawned so the poll loop never waits on the file showing up.
         self.handoffs
@@ -1727,6 +1728,20 @@ struct Handoff {
     claimed: Arc<Mutex<HashSet<FileId>>>,
     /// Where a row it sends is recorded.
     ledger: Ledger,
+    /// MusicBrainz recording the import is pinned to, if the request had one.
+    pinned_recording: Option<String>,
+}
+
+/// How a handed-off singleton is matched: pinned to its recording when the
+/// request named one, otherwise beets' own pick.
+fn singleton_choice(pinned_recording: Option<&str>) -> DriverChoice {
+    match pinned_recording {
+        Some(id) => DriverChoice::Pick {
+            data_source: MUSICBRAINZ_SOURCE.to_string(),
+            id: id.to_string(),
+        },
+        None => DriverChoice::Auto,
+    }
 }
 
 /// Find the file on disk, remove its slskd record, import it and free its
@@ -1763,7 +1778,7 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
             h.row.id, e
         );
     }
-    let job = import_job(
+    let mut job = import_job(
         Downloaded::File(path),
         vec![h.row],
         &h.target,
@@ -1771,7 +1786,8 @@ async fn hand_off(h: Handoff, backend: Arc<dyn DownloadBackend>) {
         &h.duplicates,
         &h.download_base,
     );
-    IMPORT_QUEUE.submit(job).await.wait().await;
+    job.choice = singleton_choice(h.pinned_recording.as_deref());
+    IMPORT_QUEUE.submit_with_fallback(job).await;
     registry.release(&h.key, &h.owner);
 }
 
@@ -1868,6 +1884,18 @@ mod tests {
     use soulbeet::error::MissingSetting;
     use std::path::Path;
     use tokio::sync::broadcast;
+
+    #[test]
+    fn a_pinned_singleton_picks_its_musicbrainz_recording() {
+        assert_eq!(
+            singleton_choice(Some("b7ffd2af-418f-4be2-bdd1-22f8b48613da")),
+            DriverChoice::Pick {
+                data_source: "MusicBrainz".into(),
+                id: "b7ffd2af-418f-4be2-bdd1-22f8b48613da".into(),
+            }
+        );
+        assert_eq!(singleton_choice(None), DriverChoice::Auto);
+    }
 
     fn assert_failed(row: &DownloadProgress, code: FailureCode, message: &str) {
         assert_eq!(row.state, DownloadState::Failed(message.into()));

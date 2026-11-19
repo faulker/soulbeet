@@ -9,6 +9,7 @@ mod rows;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+pub(crate) use choice::MUSICBRAINZ as MUSICBRAINZ_SOURCE;
 pub(crate) use choice::{files_gone, nothing_to_retry};
 pub use retry::{forget_retries, import_choices_for, retry_import_for, Discarded, FileLeft};
 pub(crate) use rows::import_failure;
@@ -348,6 +349,36 @@ impl ImportQueue {
                 retries: RetryStore::default(),
             }),
         }
+    }
+
+    /// Runs `job` and waits for it. A job pinned to a pick that does not
+    /// import runs once more as an automatic import, so a pin never does
+    /// worse than no pin: a skip still leaves its matches to choose from.
+    pub async fn submit_with_fallback(&self, job: ImportJob) -> JobOutcome {
+        let fallback = match job.choice {
+            DriverChoice::Auto => None,
+            _ => Some(ImportJob {
+                choice: DriverChoice::Auto,
+                choices: None,
+                ..job.clone()
+            }),
+        };
+        let outcome = self.submit(job).await.wait().await;
+        let Some(auto) = fallback else {
+            return outcome;
+        };
+        if matches!(outcome.result.outcome, ImportOutcome::Imported { .. }) {
+            return outcome;
+        }
+        let sources: Vec<&Path> = auto.sources.iter().map(PathBuf::as_path).collect();
+        if count_audio_files(&sources).await == 0 {
+            return outcome;
+        }
+        info!(
+            "Pinned import of {:?} did not import ({}); trying beets' own match",
+            auto.sources, outcome.result
+        );
+        self.submit(auto).await.wait().await
     }
 
     pub async fn submit(&self, job: ImportJob) -> ImportHandle {
@@ -957,6 +988,66 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"").unwrap();
         path
+    }
+
+    fn pinned(mut job: ImportJob) -> ImportJob {
+        job.choice = DriverChoice::Pick {
+            data_source: "MusicBrainz".into(),
+            id: "b7ffd2af-418f-4be2-bdd1-22f8b48613da".into(),
+        };
+        job
+    }
+
+    #[tokio::test]
+    async fn a_pinned_import_that_fails_falls_back_to_auto_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script(ImportResult::failed(
+            FailKind::ChoiceInvalid,
+            "MusicBrainz has no recording x".into(),
+        ));
+        stub.script(no_match(2));
+        let source = file(tmp.path(), "dl/a.flac");
+
+        let outcome = queue
+            .submit_with_fallback(pinned(job(source, &tmp.path().join("lib"))))
+            .await;
+
+        let choices = stub.choices();
+        assert_eq!(choices.len(), 2);
+        assert!(matches!(choices[0], DriverChoice::Pick { .. }));
+        assert_eq!(choices[1], DriverChoice::Auto);
+        assert!(matches!(
+            outcome.result.outcome,
+            ImportOutcome::Skipped(SkipReason::NoMatch { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_import_that_imports_runs_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        let source = file(tmp.path(), "dl/a.flac");
+
+        queue
+            .submit_with_fallback(pinned(job(source, &tmp.path().join("lib"))))
+            .await;
+
+        assert_eq!(stub.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_automatic_import_is_never_rerun() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script(no_match(1));
+        let source = file(tmp.path(), "dl/a.flac");
+
+        queue
+            .submit_with_fallback(job(source, &tmp.path().join("lib")))
+            .await;
+
+        assert_eq!(stub.choices(), vec![DriverChoice::Auto]);
     }
 
     pub(super) fn job(source: PathBuf, target: &Path) -> ImportJob {

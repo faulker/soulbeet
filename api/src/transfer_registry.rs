@@ -42,6 +42,9 @@ pub struct BatchRef {
     pub inbox: Arc<BatchInbox>,
     pub import_mode: ImportMode,
     pub duplicates: DuplicateRule,
+    /// MusicBrainz recording a single-track request asked for. Its import is
+    /// pinned to it instead of letting beets pick.
+    pub pinned_recording: Option<String>,
 }
 
 impl BatchRef {
@@ -62,6 +65,15 @@ impl BatchRef {
             inbox: BatchInbox::new(),
             import_mode,
             duplicates: DuplicateRule::Guarded,
+            pinned_recording: None,
+        }
+    }
+
+    /// The batch with its singleton imports pinned to one MusicBrainz recording.
+    pub fn with_pinned_recording(self, mbid: Option<String>) -> Self {
+        Self {
+            pinned_recording: mbid,
+            ..self
         }
     }
 
@@ -199,6 +211,7 @@ impl TransferRegistry {
                     running.target == fresh.target
                         && running.import_mode == fresh.import_mode
                         && running.duplicates == fresh.duplicates
+                        && running.pinned_recording == fresh.pinned_recording
                 })
                 .find_map(|(_, running)| Some((running.clone(), running.inbox.reserve()?))),
         };
@@ -490,6 +503,32 @@ mod tests {
                 claim.reservation.is_none()
             ),
             ("b2", DuplicateRule::Skip, true)
+        );
+    }
+
+    #[test]
+    fn a_request_never_joins_a_batch_pinned_to_another_recording() {
+        let registry = TransferRegistry::default();
+        let running = batch("user-a", "b1", ImportMode::Singleton);
+        registry.claim(&[key("01.flac")], &running);
+        let fresh = BatchRef::new(
+            TransferOwner {
+                user_id: UserId::new("user-a"),
+                batch_id: "b2".into(),
+            },
+            "Come Over".into(),
+            running.target.clone(),
+            ImportMode::Singleton,
+        )
+        .with_pinned_recording(Some("b7ffd2af-418f-4be2-bdd1-22f8b48613da".into()));
+        let claim = registry.claim_for_request(&[key("01.flac"), key("02.flac")], &fresh);
+        assert_eq!(
+            (
+                claim.batch.owner.batch_id.as_str(),
+                claim.batch.pinned_recording.as_deref(),
+                claim.reservation.is_none()
+            ),
+            ("b2", Some("b7ffd2af-418f-4be2-bdd1-22f8b48613da"), true)
         );
     }
 

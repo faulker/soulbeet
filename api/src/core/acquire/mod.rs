@@ -67,8 +67,9 @@ pub(super) fn request_stopped(e: &tokio::task::JoinError) -> Failure {
 
 /// The batch a request starts when it joins no running one. It downloads
 /// into `batch_folder(label, batch_id)` and imports into `target` in
-/// `import_mode`, treating what the library has by `duplicates`; the
-/// request's user owns it.
+/// `import_mode`, treating what the library has by `duplicates` and pinning
+/// its singleton imports to `pinned_recording` when set; the request's user
+/// owns it.
 #[derive(Clone)]
 pub struct NewBatch {
     pub batch_id: String,
@@ -76,6 +77,7 @@ pub struct NewBatch {
     pub target: PathBuf,
     pub import_mode: ImportMode,
     pub duplicates: DuplicateRule,
+    pub pinned_recording: Option<String>,
 }
 
 /// The batch a request's files go into.
@@ -107,7 +109,9 @@ impl NewBatch {
             self.target,
             self.import_mode,
         );
-        batch.with_duplicates(self.duplicates)
+        batch
+            .with_duplicates(self.duplicates)
+            .with_pinned_recording(self.pinned_recording)
     }
 }
 
@@ -550,6 +554,7 @@ mod tests {
             target,
             import_mode: running.import_mode,
             duplicates: DuplicateRule::Guarded,
+            pinned_recording: None,
         }
     }
 
@@ -573,6 +578,7 @@ mod tests {
             target: PathBuf::from("/music"),
             import_mode: ImportMode::Singleton,
             duplicates: DuplicateRule::Guarded,
+            pinned_recording: None,
         }
     }
 
@@ -587,6 +593,20 @@ mod tests {
             };
             assert_eq!(fresh.owned_by(&ctx).duplicates, rule);
         }
+    }
+
+    #[test]
+    fn a_fresh_batch_carries_its_pinned_recording() {
+        let running = batch("Come Over");
+        let ctx = ctx_of(&running);
+        let fresh = NewBatch {
+            pinned_recording: Some("b7ffd2af-418f-4be2-bdd1-22f8b48613da".into()),
+            ..new_batch("Come Over")
+        };
+        assert_eq!(
+            fresh.owned_by(&ctx).pinned_recording.as_deref(),
+            Some("b7ffd2af-418f-4be2-bdd1-22f8b48613da")
+        );
     }
 
     #[tokio::test]

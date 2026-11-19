@@ -38,6 +38,21 @@ fn auto_batch_label(group: &DownloadableGroup) -> String {
     }
 }
 
+/// The MusicBrainz recording to pin the import to: only for a request of
+/// exactly one track (no album) that carries a valid recording MBID.
+fn pinned_recording(query: &DownloadQuery) -> Option<String> {
+    let [track] = query.tracks.as_slice() else {
+        return None;
+    };
+    if query.album.is_some() {
+        return None;
+    }
+    let mbid = track.mbid.as_deref()?.trim();
+    uuid::Uuid::try_parse(mbid)
+        .ok()
+        .map(|id| id.hyphenated().to_string())
+}
+
 /// Score threshold for automatic source selection (per D-04), and an MCP job's default
 /// `min_score`. Below this, the client gets FallbackToManual with results attached.
 pub(crate) const AUTO_SELECT_SCORE_THRESHOLD: f64 = 0.7;
@@ -185,6 +200,7 @@ pub(crate) async fn run_search(
     mut run: AutoRun,
 ) {
     let (first, rest) = backends;
+    let pin = pinned_recording(&query);
     let tx = get_or_create_user_channel(&ctx.id()).await;
     let send = |event| {
         let _ = tx.send(DownloadEvent::AutoDownload(event));
@@ -324,6 +340,7 @@ pub(crate) async fn run_search(
         target,
         import_mode: run.import_mode,
         duplicates: DuplicateRule::Guarded,
+        pinned_recording: pin,
     };
     let items = numbered(picked.items);
     ledger.record(JobEvent::Picked {
@@ -369,6 +386,55 @@ mod tests {
     use soulbeet::error::SoulseekError;
     use soulbeet::DownloadBackend;
     use std::sync::Arc;
+
+    const MBID: &str = "b7ffd2af-418f-4be2-bdd1-22f8b48613da";
+
+    fn track(mbid: Option<&str>) -> shared::metadata::Track {
+        shared::metadata::Track {
+            id: "t".into(),
+            title: "Title".into(),
+            artist: "Artist".into(),
+            album_id: None,
+            album_title: None,
+            release_date: None,
+            duration: None,
+            mbid: mbid.map(str::to_string),
+            release_mbid: None,
+        }
+    }
+
+    #[test]
+    fn a_single_track_with_an_mbid_is_pinned() {
+        let q = DownloadQuery::new(vec![track(Some(MBID))]);
+        assert_eq!(pinned_recording(&q).as_deref(), Some(MBID));
+        let upper = DownloadQuery::new(vec![track(Some(&MBID.to_uppercase()))]);
+        assert_eq!(pinned_recording(&upper).as_deref(), Some(MBID));
+    }
+
+    #[test]
+    fn other_requests_are_not_pinned() {
+        let q = |tracks| DownloadQuery::new(tracks);
+        assert_eq!(pinned_recording(&q(vec![track(None)])), None);
+        assert_eq!(pinned_recording(&q(vec![track(Some("nope"))])), None);
+        assert_eq!(
+            pinned_recording(&q(vec![track(Some(MBID)), track(Some(MBID))])),
+            None
+        );
+        assert_eq!(pinned_recording(&q(vec![])), None);
+        let album = shared::metadata::Album {
+            id: "a".into(),
+            title: "Album".into(),
+            artist: "Artist".into(),
+            release_date: None,
+            mbid: None,
+            cover_url: None,
+            release_types: None,
+        };
+        assert_eq!(
+            pinned_recording(&q(vec![track(Some(MBID))]).album(album)),
+            None
+        );
+    }
 
     #[test]
     fn auto_label_is_the_group_title_else_its_items_name() {

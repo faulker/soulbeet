@@ -655,6 +655,7 @@ impl Runner<'_> {
                 JobKind::Album => ImportMode::Album,
             },
             duplicates: DuplicateRule::for_job(BatchOrigin::Mcp, Some(self.options)),
+            pinned_recording: None,
         };
         let acquisition = Acquisition {
             job: self.job.id.clone(),

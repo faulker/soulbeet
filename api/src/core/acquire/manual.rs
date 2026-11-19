@@ -144,6 +144,7 @@ async fn start_manual(
         target,
         import_mode,
         duplicates: DuplicateRule::Guarded,
+        pinned_recording: None,
     };
     let acquisition = Acquisition {
         job,

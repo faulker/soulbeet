@@ -1128,6 +1128,7 @@ async fn enqueue_anew(resume: &dyn Resume, backend: &Arc<dyn DownloadBackend>, q
         target: PathBuf::from(&job.folder.path),
         import_mode: job.import_mode,
         duplicates: DuplicateRule::for_job(job.origin, job.options.as_ref()),
+        pinned_recording: None,
     };
     resume
         .enqueue(&job.ctx, backend.clone(), fresh.into(), acquisition)
