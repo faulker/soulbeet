@@ -12,6 +12,10 @@ pub struct DownloadQuery {
     /// The metadata provider whose search gave `album`.
     #[serde(default)]
     pub metadata_provider: Option<Provider>,
+    /// Import a request for one track as that track's MusicBrainz recording
+    /// (its `mbid`) instead of letting beets pick a match. Off unless asked for.
+    #[serde(default)]
+    pub pin_recording: bool,
 }
 
 impl DownloadQuery {
@@ -21,6 +25,7 @@ impl DownloadQuery {
             tracks,
             backend: None,
             metadata_provider: None,
+            pin_recording: false,
         }
     }
 

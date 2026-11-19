@@ -76,6 +76,17 @@ pub struct ImportJob {
     pub last_run: Option<Arc<KeptRun>>,
 }
 
+/// Whether `outcome` is of a pick whose id its source does not know.
+fn pick_unresolved(outcome: &JobOutcome) -> bool {
+    matches!(
+        outcome.result.outcome,
+        ImportOutcome::Failed {
+            kind: FailKind::ChoiceInvalid,
+            ..
+        }
+    )
+}
+
 /// What the last run of a kept import knew (design 11.6).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeptRun {
@@ -289,6 +300,8 @@ pub trait QueueDeps: Send + Sync {
 struct Waiting {
     job: ImportJob,
     state: watch::Sender<JobState>,
+    /// Run instead when `job` is pinned to a pick its source cannot resolve.
+    fallback: Option<ImportJob>,
 }
 
 /// What a target's worker runs, one at a time.
@@ -351,9 +364,10 @@ impl ImportQueue {
         }
     }
 
-    /// Runs `job` and waits for it. A job pinned to a pick that does not
-    /// import runs once more as an automatic import, so a pin never does
-    /// worse than no pin: a skip still leaves its matches to choose from.
+    /// Runs `job` and waits for it. When `job` is pinned to a pick its source
+    /// cannot resolve, the same files run once more as an automatic import in
+    /// the same turn, and only that run is reported, so a pin never does worse
+    /// than no pin.
     pub async fn submit_with_fallback(&self, job: ImportJob) -> JobOutcome {
         let fallback = match job.choice {
             DriverChoice::Auto => None,
@@ -363,25 +377,15 @@ impl ImportQueue {
                 ..job.clone()
             }),
         };
-        let outcome = self.submit(job).await.wait().await;
-        let Some(auto) = fallback else {
-            return outcome;
-        };
-        if matches!(outcome.result.outcome, ImportOutcome::Imported { .. }) {
-            return outcome;
-        }
-        let sources: Vec<&Path> = auto.sources.iter().map(PathBuf::as_path).collect();
-        if count_audio_files(&sources).await == 0 {
-            return outcome;
-        }
-        info!(
-            "Pinned import of {:?} did not import ({}); trying beets' own match",
-            auto.sources, outcome.result
-        );
-        self.submit(auto).await.wait().await
+        self.enqueue_job(job, fallback).await.wait().await
     }
 
     pub async fn submit(&self, job: ImportJob) -> ImportHandle {
+        self.enqueue_job(job, None).await
+    }
+
+    /// Queues `job` on its target, with the job to run if its pick is unresolved.
+    async fn enqueue_job(&self, job: ImportJob, fallback: Option<ImportJob>) -> ImportHandle {
         let key = match canonical_target(&job.target).await {
             Ok(key) => key,
             Err(e) => {
@@ -400,7 +404,14 @@ impl ImportQueue {
 
         let owner = job.owner.clone();
         let (state, rx) = watch::channel(JobState::Queued { position: 0 });
-        self.enqueue(key, Work::Import(Box::new(Waiting { job, state })));
+        self.enqueue(
+            key,
+            Work::Import(Box::new(Waiting {
+                job,
+                state,
+                fallback,
+            })),
+        );
 
         if let Some(owner) = owner {
             let _emit = self.shared.emit_lock.lock().await;
@@ -524,14 +535,23 @@ async fn work(shared: Arc<Shared>, key: PathBuf, generation: u64) {
         }
         match item {
             Work::Import(waiting) => {
-                let Waiting { job, state } = *waiting;
-                let outcome = AssertUnwindSafe(shared.execute(&key, &job))
-                    .catch_unwind()
-                    .await
-                    .unwrap_or_else(|_| {
-                        warn!("Import into {} panicked", key.display());
-                        JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
-                    });
+                let Waiting {
+                    job,
+                    state,
+                    fallback,
+                } = *waiting;
+                let mut outcome = shared.execute_caught(&key, &job).await;
+                let job = match fallback {
+                    Some(auto) if pick_unresolved(&outcome) => {
+                        info!(
+                            "Pinned import of {:?} could not use its match ({}); trying beets' own",
+                            auto.sources, outcome.result
+                        );
+                        outcome = shared.execute_caught(&key, &auto).await;
+                        auto
+                    }
+                    _ => job,
+                };
                 shared.finish(&key, &job, outcome, &state).await;
             }
             Work::Forget { file, done } => {
@@ -596,6 +616,17 @@ impl Shared {
             Ok(importer) => importer.forget(library, file).await,
             Err(e) => ForgetOutcome::Failed(e),
         }
+    }
+
+    /// `execute`, a panic reported as the worker having stopped.
+    async fn execute_caught(&self, target: &Path, job: &ImportJob) -> JobOutcome {
+        AssertUnwindSafe(self.execute(target, job))
+            .catch_unwind()
+            .await
+            .unwrap_or_else(|_| {
+                warn!("Import into {} panicked", target.display());
+                JobOutcome::of(ImportResult::failed(FailKind::Beets, WORKER_STOPPED.into()))
+            })
     }
 
     async fn execute(&self, target: &Path, job: &ImportJob) -> JobOutcome {
@@ -1021,6 +1052,55 @@ mod tests {
             outcome.result.outcome,
             ImportOutcome::Skipped(SkipReason::NoMatch { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_import_beets_skips_is_not_rerun() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, _) = queue(StubImporter::new());
+        stub.script(no_match(1));
+        let source = file(tmp.path(), "dl/a.flac");
+
+        queue
+            .submit_with_fallback(pinned(job(source, &tmp.path().join("lib"))))
+            .await;
+
+        assert_eq!(stub.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_fallback_reports_only_its_own_outcome() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (queue, stub, deps) = queue(StubImporter::new());
+        stub.script(ImportResult::failed(
+            FailKind::ChoiceInvalid,
+            "MusicBrainz has no recording x".into(),
+        ));
+        let source = file(tmp.path(), "dl/a.flac");
+        let pinned_job = owned(
+            pinned(job(source, &tmp.path().join("lib"))),
+            &alice(),
+            &["a"],
+        );
+
+        queue.submit_with_fallback(pinned_job).await;
+
+        let finished: Vec<_> = deps
+            .progress_for(&alice())
+            .into_iter()
+            .flatten()
+            .filter(|(_, state)| {
+                !matches!(
+                    state,
+                    DownloadState::ImportQueued(_) | DownloadState::Importing
+                )
+            })
+            .collect();
+        assert_eq!(finished.len(), 1, "{finished:?}");
+        assert!(
+            matches!(finished[0].1, DownloadState::Imported),
+            "{finished:?}"
+        );
     }
 
     #[tokio::test]

@@ -38,9 +38,13 @@ fn auto_batch_label(group: &DownloadableGroup) -> String {
     }
 }
 
-/// The MusicBrainz recording to pin the import to: only for a request of
-/// exactly one track (no album) that carries a valid recording MBID.
+/// The MusicBrainz recording to pin the import to: only for a request that
+/// asks for it (`pin_recording`) of exactly one track (no album) that carries
+/// a valid recording MBID.
 fn pinned_recording(query: &DownloadQuery) -> Option<String> {
+    if !query.pin_recording {
+        return None;
+    }
     let [track] = query.tracks.as_slice() else {
         return None;
     };
@@ -403,17 +407,31 @@ mod tests {
         }
     }
 
+    /// A request for `tracks` that asks for its recording to be pinned.
+    fn pin_query(tracks: Vec<shared::metadata::Track>) -> DownloadQuery {
+        DownloadQuery {
+            pin_recording: true,
+            ..DownloadQuery::new(tracks)
+        }
+    }
+
     #[test]
-    fn a_single_track_with_an_mbid_is_pinned() {
-        let q = DownloadQuery::new(vec![track(Some(MBID))]);
+    fn a_single_track_with_an_mbid_is_pinned_when_asked() {
+        let q = pin_query(vec![track(Some(MBID))]);
         assert_eq!(pinned_recording(&q).as_deref(), Some(MBID));
-        let upper = DownloadQuery::new(vec![track(Some(&MBID.to_uppercase()))]);
+        let upper = pin_query(vec![track(Some(&MBID.to_uppercase()))]);
         assert_eq!(pinned_recording(&upper).as_deref(), Some(MBID));
     }
 
     #[test]
+    fn a_request_that_does_not_ask_is_never_pinned() {
+        let q = DownloadQuery::new(vec![track(Some(MBID))]);
+        assert_eq!(pinned_recording(&q), None);
+    }
+
+    #[test]
     fn other_requests_are_not_pinned() {
-        let q = |tracks| DownloadQuery::new(tracks);
+        let q = pin_query;
         assert_eq!(pinned_recording(&q(vec![track(None)])), None);
         assert_eq!(pinned_recording(&q(vec![track(Some("nope"))])), None);
         assert_eq!(
